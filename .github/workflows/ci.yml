@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 路由回归测试
+        run: npm test
+
+      - name: 语法校验全部源码
+        run: node --check src/index.js && for f in src/*.js; do node --check "$f"; done
+
+      - name: 单文件产物可构建且语法正确
+        run: npm run build:single && node --check worker.js

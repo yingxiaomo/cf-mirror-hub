@@ -1,0 +1,14 @@
+name = "mirror-hub"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# ── 自定义域名绑定 ──────────────────────────────────────────────
+# 国内访问 *.workers.dev 不可靠，部署后建议绑定自己的域名。
+# 取消下面两行注释并填入你的域名，之后 wrangler deploy 自动管理绑定；
+# 若已在 Dashboard 手动绑定过，保持注释即可（Dashboard 绑定不受影响）。
+# routes = [
+#   { pattern = "mirror.example.com", custom_domain = true }
+# ]
+
+[observability]
+enabled = true

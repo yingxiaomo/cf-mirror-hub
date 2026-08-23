@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.gitnexus/
+.claude/
+AGENTS.md
+CLAUDE.md
+.dev.vars
+*.log
