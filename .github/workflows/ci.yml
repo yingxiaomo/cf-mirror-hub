@@ -30,3 +30,26 @@ jobs:
 
       - name: 校验单文件产物与源码同步
         run: git diff --exit-code worker.js
+
+  deploy:
+    needs: test
+    # 仅 master push 触发；未配置 CLOUDFLARE_API_TOKEN 仓库密钥时自动跳过
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 部署到 Cloudflare Workers
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: npx wrangler deploy

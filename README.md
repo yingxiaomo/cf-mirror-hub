@@ -59,6 +59,18 @@ npm run deploy        # 或 npx wrangler deploy
 
 本地调试：`npm run dev`（workerd 本地模拟，注意本机网络需可达上游）。
 
+#### 4. 可选：push 即自动部署（GitHub Actions）
+
+仓库内置了 deploy 流水线（`.github/workflows/ci.yml` 的 deploy job）：push 到 master 且测试通过后自动 `wrangler deploy`，部署和代码永远同步。启用只需配置两个仓库密钥：
+
+1. Cloudflare Dashboard → 右上角头像 → **My Profile → API Tokens → Create Token**，选模板 **Edit Cloudflare Workers**，创建后复制 token
+2. GitHub 仓库 → **Settings → Secrets and variables → Actions → New repository secret**，添加两条：
+   - `CLOUDFLARE_API_TOKEN` = 上一步的 token
+   - `CLOUDFLARE_ACCOUNT_ID` = 你的 Cloudflare 账户 ID（Dashboard → Workers & Pages 概览页右侧可见）
+3. 配置完成后每次 push 到 master 自动上线；未配置密钥时该 job 自动跳过，不影响 CI
+
+> 替代方案：Cloudflare 官方 Workers Builds（Dashboard → 该 Worker → Settings → Build → Connect，绑定仓库即可，无需密钥）。与上面的 Actions 方式二选一，两边同时开着也只是重复部署，互不冲突。
+
 两种方式部署完成后访问 `https://你的域名/` 即可看到使用说明首页。
 
 ---
