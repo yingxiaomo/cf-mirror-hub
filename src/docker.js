@@ -16,6 +16,8 @@
  *   ghcr：docker pull <mirror>/ghcr/<user>/<image>（全限定名）
  */
 
+import { fetchFollowRedirects } from './http.js';
+
 const HUB_REGISTRY = 'https://registry-1.docker.io';
 const HUB_AUTH = 'https://auth.docker.io';
 const GHCR_BASE = 'https://ghcr.io';
@@ -39,15 +41,15 @@ export function resolveUpstream(pathname) {
   return { registryBase: HUB_REGISTRY, realPath: pathname, isGhcr: false };
 }
 
-/** Docker Hub 单段镜像名自动补 library/（官方镜像）；<owner>/<repo> 两段名保持不变 */
+/** Docker Hub 单段镜像名自动补 library/（官方镜像）；<owner>/<repo> 两段名保持不变。
+ *  行尾锚定：Registry API 的 action 恒为倒数第二段（blobs/uploads、manifests/<ref>、tags/list），
+ *  贪婪匹配到最后一处关键字，避免仓库名恰好叫 manifests/blobs/tags 时误判。 */
 export function normalizeHubPath(realPath) {
-  // 以 manifests/blobs/tags 三个 action 关键字锚定出完整镜像名，
-  // 避免把 /v2/<owner>/<repo>/... 里的 <owner> 误判为官方单段名
-  const m = /^\/v2\/(.+?)\/(manifests|blobs|tags)((?:\/).*)?$/.exec(realPath);
+  const m = /^\/v2\/(.+)\/(manifests\/[^/]+|blobs\/[^/]+|tags\/list)(\/)?$/.exec(realPath);
   if (!m) return realPath;
-  const [, name, action, rest] = m;
+  const [, name, action, trailingSlash] = m;
   if (name.includes('/')) return realPath;
-  return `/v2/library/${name}/${action}${rest || ''}`;
+  return `/v2/library/${name}/${action}${trailingSlash || ''}`;
 }
 
 /** 清理响应头：去掉 CF 注入头，保留 Registry 协议相关头 */
@@ -89,32 +91,6 @@ function upstreamHeaders(request) {
   return h;
 }
 
-/**
- * 手动跟随重定向的 fetch。
- * blob 层会 30x 到对象存储 CDN（如 production.cloudflare.docker.com 的预签名 URL），
- * 跨主机跳转时必须删除 Authorization 头——预签名 URL 自带鉴权参数，多出的 Auth 头会导致校验失败。
- */
-async function fetchFollowRedirects(url, init, maxRedirects = 3) {
-  let current = url;
-  let headers = new Headers(init.headers);
-  for (let i = 0; i < maxRedirects; i++) {
-    const resp = await fetch(current, { ...init, headers, redirect: 'manual' });
-    if (resp.status >= 300 && resp.status < 400) {
-      const loc = resp.headers.get('location');
-      if (!loc) return resp;
-      const next = new URL(loc, current).href;
-      if (new URL(next).host !== new URL(current).host) {
-        headers.delete('authorization');
-      }
-      current = next;
-      continue;
-    }
-    return resp;
-  }
-  // 超出层数：最后一跳交给运行时自动跟随兜底
-  return fetch(current, { ...init, headers });
-}
-
 /** Registry API 主处理 */
 export async function handleDocker(request) {
   const reqUrl = new URL(request.url);
@@ -132,7 +108,9 @@ export async function handleDocker(request) {
     init.body = request.body;
   } else {
     // GET/HEAD 开启 CF 边缘缓存 1 小时：同镜像重复拉取命中边缘不回源，
-    // 显著减少对上游 registry 的请求次数（缓解 Docker Hub 匿名限流）
+    // 显著减少对上游 registry 的请求次数（缓解 Docker Hub 匿名限流）。
+    // 注意取舍：缓存键只含 URL 不含凭据，带 Authorization 拉到的响应可能被
+    // 同 URL 的匿名请求命中——不要经本镜像拉取私有镜像（详见 README 已知限制）。
     init.cf = { cacheTtl: 3600 };
   }
 

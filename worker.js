@@ -19,6 +19,27 @@
  * 免费层限额约 100k 请求/天；仅供个人与小规模使用，请勿公开传播。
  */
 
+// src/http.js
+async function fetchFollowRedirects(url, init, maxRedirects = 3) {
+  let current = url;
+  let headers = new Headers(init.headers);
+  for (let i = 0; i < maxRedirects; i++) {
+    const resp = await fetch(current, { ...init, headers, redirect: "manual" });
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get("location");
+      if (!loc) return resp;
+      const next = new URL(loc, current).href;
+      if (new URL(next).host !== new URL(current).host) {
+        headers.delete("authorization");
+      }
+      current = next;
+      continue;
+    }
+    return resp;
+  }
+  return fetch(current, { ...init, headers });
+}
+
 // src/github.js
 var GH_HOSTS = /* @__PURE__ */ new Set([
   "github.com",
@@ -38,7 +59,12 @@ function json(obj, status = 200) {
   });
 }
 function extractTargetPath(pathname) {
-  const p = decodeURIComponent(pathname);
+  let p;
+  try {
+    p = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
   if (p.startsWith("/gh/")) return p.slice("/gh/".length);
   if (/^\/https?:\/\//i.test(p)) return p.slice(1);
   return null;
@@ -65,6 +91,7 @@ function upstreamRequestHeaders(request, targetHost) {
   h.delete("x-forwarded-for");
   h.delete("x-forwarded-proto");
   h.delete("x-real-ip");
+  h.delete("cookie");
   if (targetHost) h.set("referer", `https://${targetHost}/`);
   return h;
 }
@@ -85,16 +112,15 @@ async function handleGithub(request) {
   }
   const init = {
     method: request.method,
-    headers: upstreamRequestHeaders(request, target.hostname),
-    redirect: "follow"
-    // release 资产会 302 到对象存储，直接跟随并流式回传
+    headers: upstreamRequestHeaders(request, target.hostname)
   };
   if (!["GET", "HEAD"].includes(request.method)) {
     init.body = request.body;
   }
-  const resp = await fetch(target.href, init);
+  const resp = await fetchFollowRedirects(target.href, init);
   const headers = new Headers(resp.headers);
-  headers.set("x-mirror-target", target.host);
+  headers.delete("set-cookie");
+  headers.set("x-mirror-target", resp.url ? new URL(resp.url).host : target.host);
   return new Response(resp.body, { status: resp.status, headers });
 }
 
@@ -119,11 +145,11 @@ function resolveUpstream(pathname) {
   return { registryBase: HUB_REGISTRY, realPath: pathname, isGhcr: false };
 }
 function normalizeHubPath(realPath) {
-  const m = /^\/v2\/(.+?)\/(manifests|blobs|tags)((?:\/).*)?$/.exec(realPath);
+  const m = /^\/v2\/(.+)\/(manifests\/[^/]+|blobs\/[^/]+|tags\/list)(\/)?$/.exec(realPath);
   if (!m) return realPath;
-  const [, name, action, rest] = m;
+  const [, name, action, trailingSlash] = m;
   if (name.includes("/")) return realPath;
-  return `/v2/library/${name}/${action}${rest || ""}`;
+  return `/v2/library/${name}/${action}${trailingSlash || ""}`;
 }
 function responseHeaders(src, extra) {
   const h = new Headers();
@@ -159,25 +185,6 @@ function upstreamHeaders(request) {
   h.delete("x-real-ip");
   h.delete("cookie");
   return h;
-}
-async function fetchFollowRedirects(url, init, maxRedirects = 3) {
-  let current = url;
-  let headers = new Headers(init.headers);
-  for (let i = 0; i < maxRedirects; i++) {
-    const resp = await fetch(current, { ...init, headers, redirect: "manual" });
-    if (resp.status >= 300 && resp.status < 400) {
-      const loc = resp.headers.get("location");
-      if (!loc) return resp;
-      const next = new URL(loc, current).href;
-      if (new URL(next).host !== new URL(current).host) {
-        headers.delete("authorization");
-      }
-      current = next;
-      continue;
-    }
-    return resp;
-  }
-  return fetch(current, { ...init, headers });
 }
 async function handleDocker(request) {
   const reqUrl = new URL(request.url);

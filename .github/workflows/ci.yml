@@ -27,3 +27,6 @@ jobs:
 
       - name: 单文件产物可构建且语法正确
         run: npm run build:single && node --check worker.js
+
+      - name: 校验单文件产物与源码同步
+        run: git diff --exit-code worker.js

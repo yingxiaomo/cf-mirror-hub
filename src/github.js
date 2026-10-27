@@ -7,6 +7,8 @@
  * 同样支持 raw / codeload / gist / git clone（smart HTTP）。
  */
 
+import { fetchFollowRedirects } from './http.js';
+
 const GH_HOSTS = new Set([
   'github.com',
   'raw.githubusercontent.com',
@@ -28,7 +30,12 @@ function json(obj, status = 200) {
 
 /** 从 pathname 提取目标 URL 字符串（兼容 /gh/ 前缀与无前缀自动识别两种形式） */
 export function extractTargetPath(pathname) {
-  const p = decodeURIComponent(pathname);
+  let p;
+  try {
+    p = decodeURIComponent(pathname);
+  } catch {
+    return null; // 非法百分号编码（如 %zz）：交由调用方按 400 拒绝
+  }
   if (p.startsWith('/gh/')) return p.slice('/gh/'.length);
   if (/^\/https?:\/\//i.test(p)) return p.slice(1); // 无前缀：去掉开头 '/'
   return null;
@@ -63,6 +70,7 @@ export function upstreamRequestHeaders(request, targetHost) {
   h.delete('x-forwarded-for');
   h.delete('x-forwarded-proto');
   h.delete('x-real-ip');
+  h.delete('cookie'); // 不把镜像域名上的 cookie 转发给 GitHub
   if (targetHost) h.set('referer', `https://${targetHost}/`);
   return h;
 }
@@ -88,15 +96,17 @@ export async function handleGithub(request) {
   const init = {
     method: request.method,
     headers: upstreamRequestHeaders(request, target.hostname),
-    redirect: 'follow', // release 资产会 302 到对象存储，直接跟随并流式回传
   };
   if (!['GET', 'HEAD'].includes(request.method)) {
     init.body = request.body; // git clone 的 POST /git-upload-pack 走这里
   }
 
-  const resp = await fetch(target.href, init);
+  // release 资产会 302 到对象存储，手动逐跳跟随；跨主机跳转删 Authorization，
+  // 避免客户端令牌被转发给 CDN（S3 遇到「Auth 头 + 预签名参数」双重鉴权会 400）
+  const resp = await fetchFollowRedirects(target.href, init);
 
   const headers = new Headers(resp.headers);
-  headers.set('x-mirror-target', target.host);
+  headers.delete('set-cookie'); // 上游会话 cookie 不落镜像域名
+  headers.set('x-mirror-target', resp.url ? new URL(resp.url).host : target.host);
   return new Response(resp.body, { status: resp.status, headers });
 }

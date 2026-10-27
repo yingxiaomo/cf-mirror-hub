@@ -101,7 +101,7 @@ docker pull nginx          # 自动走镜像
 
 ```bash
 docker pull mirror.example.com/library/nginx
-docker pull mirror.example.com/user/private-image   # 私有镜像需先 docker login mirror.example.com？否——仍用 docker.io 凭据透传
+docker pull mirror.example.com/user/private-image   # 私有镜像：先 docker login mirror.example.com，凭据经 /auth/token 透传至 auth.docker.io
 ```
 
 > 注意：`registry-mirrors` 只对 Docker Hub 生效；ghcr/quay 等必须用全限定名。
@@ -160,7 +160,7 @@ Docker Hub 按**请求源 IP** 对匿名拉取限流，而 Cloudflare Workers �
 - **全服务免前缀路由**（`src/index.js`）：按序匹配——GitHub 以 `/http(s)://` 开头；npm 强特征为 `/-/` 开头 / 含 `/-/` 段且 `.tgz` 结尾 / 首段 `@scope`；OpenWrt 顶层保留目录（releases/packages/snapshots/docs/misc/downloads）自动转发 downloads.openwrt.org；其余路径兜底视为 npm 包查询。旧显式前缀 `/gh/`、`/npm/`、`/owrt/` 全部兼容。已知取舍：若 npm 恰有与 OpenWrt 顶层目录同名的包（如名为 `releases` 的包），需用 `/npm/releases` 访问。
 - **Registry v2 令牌重写**（`src/docker.js` 核心）：客户端 ping `/v2/` 时上游返回 401 + `WWW-Authenticate: Bearer realm="https://auth.docker.io/token"`；Worker 把 realm 重写为自身 `/auth/token`，客户端后续取票请求由 Worker 按 `service` 参数分发到 `auth.docker.io` 或 `ghcr.io/token`。
 - **边缘缓存**：registry 的 GET/HEAD 响应带 `cf.cacheTtl: 3600`，同镜像重复拉取命中 CF 边缘节点不回源，从请求量源头缓解 Docker Hub 匿名限流。
-- **重定向安全跟随**：blob 层 30x 到对象存储 CDN 时手动逐跳跟随（最多 3 层），跨主机跳转删除 `Authorization` 头——预签名 URL 自带鉴权参数，多余 Auth 头会导致校验失败。
+- **重定向安全跟随**：Docker blob 与 GitHub release 资产 30x 到对象存储 CDN 时手动逐跳跟随（最多 3 层，共用 `src/http.js`），跨主机跳转删除 `Authorization` 头——预签名 URL 自带鉴权参数，多余 Auth 头会导致 S3 类存储校验失败（400）。
 - **官方镜像补名**：Docker Hub 单段镜像名（如 `alpine`）在转发前自动补成 `library/alpine`；以 manifests/blobs/tags 关键字锚定镜像名，避免误伤 `<owner>/<repo>` 两段名。
 - **npm 元数据改写**：对 JSON 响应用字符串 `replaceAll('https://registry.npmjs.org/', '<mirror>/')` 而非 parse/stringify，快一个数量级，规避免费层 CPU 上限；同时删除 etag 防止缓存不一致。
 - **凭据安全编码**：服务端 Docker Hub 凭据经 BOM/空白清理后用 `TextEncoder` + 分块字节 base64 编码——Worker 环境的 `btoa` 仅支持 Latin1，Secret 值混入非 Latin1 字符时会静默失败。
@@ -171,7 +171,8 @@ Docker Hub 按**请求源 IP** 对匿名拉取限流，而 Cloudflare Workers �
 1. **Docker Hub 匿名限流**：Docker Hub 按请求源 IP 对匿名拉取限流，而 Cloudflare Workers 的出口 IP 是全球租户共享池，未配置凭据时可能遇到 429。强烈建议按上文配置 `DOCKER_HUB_USERNAME`/`DOCKER_HUB_PAT` 账号凭据（配合边缘缓存基本可消除该问题）；极端情况下可改走 ghcr 同步镜像或自建中转。
 2. **免费额度**：约 100k 请求/天。一次 `docker pull` 约产生 3–10 个请求，个人使用绰绰有余；公开传播会很快打爆额度并被滥用风险波及账号。
 3. **只读镜像**：不支持 npm publish、不支持推送镜像。
-4. 合规：仅建议个人/小规模自用。
+4. **私有镜像请勿经本站拉取**：Registry 响应的边缘缓存键只含 URL、不含客户端凭据，带鉴权拉取到的私有 manifest 理论上可能被缓存后返回给同 URL 的匿名请求。私有镜像请直连官方 registry；公开镜像不受影响。
+5. 合规：仅建议个人/小规模自用。
 
 ## 五、目录结构
 
@@ -182,12 +183,13 @@ Docker Hub 按**请求源 IP** 对匿名拉取限流，而 Cloudflare Workers �
 ├── src/
 │   ├── index.js       # 入口 + 免前缀智能路由
 │   ├── github.js      # GitHub 反代（白名单校验）
-│   ├── docker.js      # Docker Hub + ghcr（token 重写 / 边缘缓存 / 重定向跟随核心）
+│   ├── docker.js      # Docker Hub + ghcr（token 重写 / 边缘缓存 / library 补名核心）
 │   ├── npm.js         # npm 反代 + tarball 地址改写
 │   ├── openwrt.js     # OpenWrt 文件反代
+│   ├── http.js        # 共享工具：手动跟随重定向（跨主机删 Authorization）
 │   └── homepage.js    # 使用说明首页
 ├── test/
-│   └── test-routes.mjs  # 路由回归测试（26 用例零依赖，npm test 一键回归）
+│   └── test-routes.mjs  # 路由回归测试（41 用例零依赖，npm test 一键回归）
 └── package.json
 ```
 

@@ -1,7 +1,8 @@
 /**
  * 回归测试：node test/test-routes.mjs
  * 覆盖：免前缀路由分发 / 显式前缀兼容 / GitHub 白名单拦截 /
- *       Registry realm 重写 / library 补名 / 重定向跨主机删 Authorization
+ *       Registry realm 重写 / library 补名（含 manifests/blobs/tags 仓库名边界）/
+ *       重定向跨主机删 Authorization / cookie 不透传 / auth-token 按服务分发
  * 零依赖，mock 全局 fetch，纯本地运行。
  */
 import assert from 'node:assert/strict';
@@ -18,7 +19,13 @@ const calls = [];
 let script = null; // (url) => Response
 globalThis.fetch = async (url, init = {}) => {
   const h = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
-  calls.push({ url: String(url), auth: h.get('authorization'), cf: init.cf || null, redirect: init.redirect });
+  calls.push({
+    url: String(url),
+    auth: h.get('authorization'),
+    cookie: h.get('cookie'),
+    cf: init.cf || null,
+    redirect: init.redirect,
+  });
   if (script) return script(String(url));
   return new Response(JSON.stringify({ upstream: url }), { status: 200, headers: { 'content-type': 'application/json' } });
 };
@@ -27,9 +34,9 @@ const mod = (await import('../src/index.js')).default;
 const docker = await import('../src/docker.js');
 const github = await import('../src/github.js');
 const ORIGIN = 'https://hub.example.com';
-const fetchAt = async (path, opts = {}) => {
+const fetchAt = async (path, opts = {}, env = {}) => {
   calls.length = 0;
-  return mod.fetch(new Request(ORIGIN + path, opts), {}, {});
+  return mod.fetch(new Request(ORIGIN + path, opts), env, {});
 };
 
 // ── 1. 免前缀路由分发 ──
@@ -66,6 +73,23 @@ const fetchAt = async (path, opts = {}) => {
   check('extractTargetPath 无前缀', github.extractTargetPath('/https://x/y') === 'https://x/y');
   check('extractTargetPath 带前缀', github.extractTargetPath('/gh/https://x/y') === 'https://x/y');
   check('extractTargetPath 非 GitHub 路径返回 null', github.extractTargetPath('/npm/react') === null);
+
+  // 重定向：跨主机逐跳删 Authorization；cookie 不透传；非法编码 400
+  script = (u) => {
+    if (u.includes('github.com')) return new Response(null, { status: 302, headers: { location: 'https://objects.example.com/asset' } });
+    return new Response('ASSET', { status: 200 });
+  };
+  const asset = await fetchAt('/https://github.com/u/r/releases/download/v1/f.zip', { headers: { authorization: 'Bearer gt' } });
+  check('GitHub 第一跳带 Bearer', calls[0]?.auth === 'Bearer gt');
+  check('GitHub 跨主机重定向删除 Authorization', calls[1]?.auth === null);
+  check('GitHub 重定向终点内容正确', (await asset.text()) === 'ASSET');
+
+  await fetchAt('/https://raw.githubusercontent.com/a/b/c', { headers: { cookie: 'sid=1' } });
+  check('GitHub 请求不透传 cookie', calls[0]?.cookie === null);
+
+  const badEnc = await fetchAt('/gh/https%3A%2F%2Fraw.githubusercontent.com/%zz');
+  check('非法百分号编码返回 400', badEnc.status === 400);
+  script = null;
 }
 
 // ── 3. Docker：realm 重写 / library 补名 / 缓存与重定向 ──
@@ -78,6 +102,10 @@ const fetchAt = async (path, opts = {}) => {
   check('library 补名（单段名）', docker.normalizeHubPath('/v2/alpine/manifests/latest') === '/v2/library/alpine/manifests/latest');
   check('两段名不补', docker.normalizeHubPath('/v2/user/repo/manifests/1') === '/v2/user/repo/manifests/1');
   check('ghcr 路径解析', JSON.stringify(docker.resolveUpstream('/v2/ghcr/u/i/blobs/x')) === JSON.stringify({ registryBase: 'https://ghcr.io', realPath: '/v2/u/i/blobs/x', isGhcr: true }));
+  // 仓库名恰好叫 manifests/blobs/tags 的两段名镜像：行尾锚定后不得误补 library/
+  check('仓库名恰为 manifests 不误补', docker.normalizeHubPath('/v2/user/manifests/manifests/latest') === '/v2/user/manifests/manifests/latest');
+  check('仓库名恰为 tags 不误补', docker.normalizeHubPath('/v2/owner/tags/tags/list') === '/v2/owner/tags/tags/list');
+  check('blob 上传路径（尾斜杠）仍补名', docker.normalizeHubPath('/v2/alpine/blobs/uploads/') === '/v2/library/alpine/blobs/uploads/');
 
   // GET 带 cacheTtl；POST 不带
   script = () => new Response('{}', { status: 200 });
@@ -103,6 +131,27 @@ const fetchAt = async (path, opts = {}) => {
   const home = await fetchAt('/');
   const text = await home.text();
   check('首页 200 且含免前缀示例', home.status === 200 && text.includes('/https://github.com/user/repo'));
+}
+
+// ── 5. /auth/token：按 service 分发 / scope 改写 / 凭据优先级 ──
+{
+  script = null; // 用 mock 默认 200 响应
+  await fetchAt('/auth/token?service=ghcr.io&scope=repository:ghcr/u/i:pull');
+  const gh = new URL(calls[0]?.url || 'about:blank');
+  check('ghcr service 分发到 ghcr.io', gh.host === 'ghcr.io');
+  check('ghcr scope 剥掉 ghcr/ 前缀', gh.searchParams.get('scope') === 'repository:u/i:pull');
+
+  await fetchAt('/auth/token?service=registry.docker.io&scope=repository:alpine:pull');
+  const hub = new URL(calls[0]?.url || 'about:blank');
+  check('hub service 分发到 auth.docker.io', hub.host === 'auth.docker.io');
+  check('hub scope 单段名补 library/', hub.searchParams.get('scope') === 'repository:library/alpine:pull');
+
+  const pat = await fetchAt('/auth/token?service=registry.docker.io&scope=repository:alpine:pull', {}, { DOCKER_HUB_USERNAME: 'u', DOCKER_HUB_PAT: 'p' });
+  check('服务端 PAT 注入 Basic 凭据', (calls[0]?.auth || '').startsWith('Basic '));
+  check('PAT 注入后响应正常透传', pat.status === 200);
+
+  await fetchAt('/auth/token?service=registry.docker.io&scope=repository:alpine:pull', { headers: { authorization: 'Basic client' } }, { DOCKER_HUB_USERNAME: 'u', DOCKER_HUB_PAT: 'p' });
+  check('客户端登录态优先于服务端 PAT', calls[0]?.auth === 'Basic client');
 }
 
 console.log(`\n${passed} 通过, ${failed} 失败`);
